@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -13,7 +14,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/storage"
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -155,18 +155,21 @@ func find(uuid string) (bson.Raw, error) {
 }
 
 // create storage client
-func createStorageClient() *storage.Container {
-	storageAccountName := os.Getenv(azureStorageAccount)
-	accessKey := os.Getenv("")
-	client, err := storage.NewBasicClient(storageAccountName, accessKey)
+func createStorageClient() azblob.ContainerURL {
+	accountName, accountKey := os.Getenv("AZURE_STORAGE_ACCOUNT"), os.Getenv("AZURE_STORAGE_ACCESS_KEY")
+	credential, err := azblob.NewSharedKeyCredential(accountName, accountKey)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Invalid credentials with error: " + err.Error())
 	}
+	p := azblob.NewPipeline(credential, azblob.PipelineOptions{})
 	containerName := "filer"
-	blobService := client.GetBlobService()
-	container := blobService.GetContainerReference(containerName)
+	// From the Azure portal, get your storage account blob service URL endpoint.
+	URL, _ := url.Parse(
+		fmt.Sprintf("https://%s.blob.core.windows.net/%s", accountName, containerName))
 
-	return container
+	containerURL := azblob.NewContainerURL(*URL, p)
+
+	return containerURL
 }
 
 // file upload to azure storage
@@ -209,8 +212,33 @@ func upload(fileData multipart.File, fileName string) {
 }
 
 // download from azure storage
-func download() {
+func download(fileName string) *bytes.Buffer {
 
+	ctx := context.Background()
+	accountName, accountKey := os.Getenv("AZURE_STORAGE_ACCOUNT"), os.Getenv("AZURE_STORAGE_ACCESS_KEY")
+	credential, err := azblob.NewSharedKeyCredential(accountName, accountKey)
+	if err != nil {
+		log.Fatal("Invalid credentials with error: " + err.Error())
+	}
+	p := azblob.NewPipeline(credential, azblob.PipelineOptions{})
+	containerName := "filer"
+	// From the Azure portal, get your storage account blob service URL endpoint.
+	URL, _ := url.Parse(
+		fmt.Sprintf("https://%s.blob.core.windows.net/%s", accountName, containerName))
+
+	containerURL := azblob.NewContainerURL(*URL, p)
+	blobURL := containerURL.NewBlockBlobURL(fileName)
+	downloadResponse, err := blobURL.Download(ctx, 0, azblob.CountToEnd, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
+	handleErrors(err)
+
+	downloadedData := &bytes.Buffer{}
+	bodyStream := downloadResponse.Body(azblob.RetryReaderOptions{MaxRetryRequests: 20})
+
+	_, err = downloadedData.ReadFrom(bodyStream)
+	handleErrors(err)
+	bodyStream.Close()
+
+	return downloadedData
 }
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
