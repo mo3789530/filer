@@ -67,7 +67,7 @@ func handleErrors(err error) {
 
 // create random string
 func makeRandomStr(digit uint32) (string, error) {
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@!?$&#<>"
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 	// 乱数を生成
 	b := make([]byte, digit)
