@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
@@ -39,9 +41,15 @@ const (
 
 // define mongodb collection type
 type File struct {
-	ID      primitive.ObjectID `bson:"_id,omitempty"`
-	LinkUrl string             `bson:"url"`
-	UUID    string             `bson:"uuid"`
+	ID       primitive.ObjectID `bson:"_id,omitempty"`
+	LinkUrl  string             `bson:"url"`
+	UUID     string             `bson:"uuid"`
+	FileName string             `bson:"filename"`
+}
+
+type Upload struct {
+	Status int
+	Secret string
 }
 
 func handleErrors(err error) {
@@ -113,7 +121,7 @@ func connect() *mongo.Client {
 }
 
 // create a saved link and uuid
-func create(url string) {
+func create(url, filename string) (string, error) {
 	c := connect()
 	ctx := context.Background()
 	defer c.Disconnect(ctx)
@@ -122,14 +130,17 @@ func create(url string) {
 	pass, err := makeRandomStr(8)
 	if err != nil {
 		log.Fatal(err)
+		return "", err
 	}
 
-	r, err := fileLinkCollection.InsertOne(ctx, File{LinkUrl: url, UUID: pass})
+	r, err := fileLinkCollection.InsertOne(ctx, File{LinkUrl: url, UUID: pass, FileName: filename})
 
 	if err != nil {
 		log.Fatalf("failed to add todo %v", err)
+		return "", err
 	}
 	fmt.Println("Added file link", r.InsertedID)
+	return pass, nil
 }
 
 // find save link and uuid
@@ -145,7 +156,7 @@ func find(uuid string) (bson.Raw, error) {
 	err := fileLinkCollection.FindOne(ctx, filter, findOptions).Decode(&doc)
 	if err == mongo.ErrNoDocuments {
 		log.Println("document not found")
-		return nil, nil
+		return nil, err
 	}
 	if err != nil {
 		log.Fatal("failed to find %v", err)
@@ -173,7 +184,7 @@ func createStorageClient() azblob.ContainerURL {
 }
 
 // file upload to azure storage
-func upload(fileData multipart.File, fileName string) {
+func upload(fileData multipart.File, fileName string) (string, error) {
 	ctx := context.Background()
 
 	accountName, accountKey := os.Getenv("AZURE_STORAGE_ACCOUNT"), os.Getenv("AZURE_STORAGE_ACCESS_KEY")
@@ -190,9 +201,12 @@ func upload(fileData multipart.File, fileName string) {
 	containerURL := azblob.NewContainerURL(*URL, p)
 
 	// Create a file to test the upload and download.
-	fmt.Printf("Creating a dummy file to test the upload and download\n")
+	fmt.Printf("Creating a file to test the upload and download\n")
 	saveFile, err := os.Create(fileName)
 	handleErrors(err)
+	if err != nil {
+		return "", err
+	}
 	defer saveFile.Close()
 
 	// ファイルにデータを書き込む
@@ -203,22 +217,31 @@ func upload(fileData multipart.File, fileName string) {
 	blobURL := containerURL.NewBlockBlobURL(fileName)
 	file, err := os.Open(fileName)
 	handleErrors(err)
+	if err != nil {
+		return "", err
+	}
 
 	fmt.Printf("Uploading the file with blob name: %s\n", fileName)
 	_, err = azblob.UploadFileToBlockBlob(ctx, file, blobURL, azblob.UploadToBlockBlobOptions{
 		BlockSize:   4 * 1024 * 1024,
 		Parallelism: 16})
 	handleErrors(err)
+	if err != nil {
+		return "", err
+	}
+
+	return blobURL.String(), nil
 }
 
 // download from azure storage
-func download(fileName string) *bytes.Buffer {
+func download(fileName string) (*bytes.Buffer, error) {
 
 	ctx := context.Background()
 	accountName, accountKey := os.Getenv("AZURE_STORAGE_ACCOUNT"), os.Getenv("AZURE_STORAGE_ACCESS_KEY")
 	credential, err := azblob.NewSharedKeyCredential(accountName, accountKey)
 	if err != nil {
 		log.Fatal("Invalid credentials with error: " + err.Error())
+		return nil, err
 	}
 	p := azblob.NewPipeline(credential, azblob.PipelineOptions{})
 	containerName := "filer"
@@ -230,15 +253,21 @@ func download(fileName string) *bytes.Buffer {
 	blobURL := containerURL.NewBlockBlobURL(fileName)
 	downloadResponse, err := blobURL.Download(ctx, 0, azblob.CountToEnd, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
 	handleErrors(err)
+	if err != nil {
+		return nil, err
+	}
 
 	downloadedData := &bytes.Buffer{}
 	bodyStream := downloadResponse.Body(azblob.RetryReaderOptions{MaxRetryRequests: 20})
 
 	_, err = downloadedData.ReadFrom(bodyStream)
 	handleErrors(err)
+	if err != nil {
+		return nil, err
+	}
 	bodyStream.Close()
 
-	return downloadedData
+	return downloadedData, nil
 }
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
@@ -257,25 +286,73 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	// Get file data
 
+	fmt.Printf("upload")
 	formFile, formFileHeader, err := r.FormFile("file")
+
 	handleErrors(err)
 	defer formFile.Close()
 
-	// Get file name from FormData
-	upload(formFile, formFileHeader.Filename)
+	fmt.Printf("Upload file is " + formFileHeader.Filename)
 
-	message := "This HTTP triggered function executed successfully. Pass a name in the query string for a personalized response.\n"
-	name := r.URL.Query().Get("name")
-	if name != "" {
-		message = fmt.Sprintf("Hello, %s. This HTTP triggered function executed successfully.\n", name)
+	// Get file name from FormData
+	url, err := upload(formFile, formFileHeader.Filename)
+	if err != nil {
+		fmt.Fprint(w, http.StatusText(http.StatusBadRequest))
 	}
-	fmt.Fprint(w, message)
+
+	secret, err := create(url, formFileHeader.Filename)
+	if err != nil {
+		fmt.Fprint(w, http.StatusText(http.StatusBadRequest))
+	}
+
+	uploaded := Upload{http.StatusOK, secret}
+
+	res, err := json.Marshal(uploaded)
+	if err != nil {
+		fmt.Fprint(w, http.StatusText(http.StatusBadRequest))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(res)
+
 }
 
 // Validation password
 // Download data from azure storage
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
+	secret := r.URL.Query().Get("secret")
+	if secret == "" {
+		fmt.Fprint(w, http.StatusText(http.StatusBadRequest))
+		return
+	}
+
+	bson, err := find(secret)
+	if err != nil {
+		fmt.Fprint(w, http.StatusText(http.StatusNotFound))
+		return
+	}
+
+	log.Printf("Find filename: " + bson.String())
+
+	filename, err := bson.LookupErr("filename")
+	if err != nil || filename.StringValue() == "" {
+		fmt.Fprint(w, http.StatusText(http.StatusBadRequest))
+		return
+	}
+
+	log.Println(filename)
+
+	data, err := download(filename.StringValue())
+	if err != nil {
+		fmt.Fprint(w, http.StatusText(http.StatusNotFound))
+		return
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(filename.StringValue()))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(data.Bytes())
 }
 
 func main() {
